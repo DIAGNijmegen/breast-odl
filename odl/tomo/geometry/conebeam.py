@@ -21,7 +21,7 @@ from odl.tomo.util.utility import (
 from odl.util import signature_string, indent, array_str
 
 
-__all__ = ('FanBeamGeometry', 'ConeFlatGeometry',
+__all__ = ('FanBeamGeometry', 'ConeFlatGeometry', 'DBTGeometry',
            'cone_beam_geometry', 'helical_geometry')
 
 
@@ -987,6 +987,7 @@ class ConeFlatGeometry(DivergentBeamGeometry, AxisOrientedGeometry):
             axes_enumeration = np.moveaxis(deriv, -2, 0)
         """
         # Transpose to take dot along axis 1
+
         axes = self.rotation_matrix(angle).dot(self.det_axes_init.T)
         # `axes` has shape (a, 3, 2), need to roll the last dimensions
         # to the second-to-last place
@@ -1240,6 +1241,672 @@ class ConeFlatGeometry(DivergentBeamGeometry, AxisOrientedGeometry):
     # Manually override the abstract method in `Geometry` since it's found
     # first
     rotation_matrix = AxisOrientedGeometry.rotation_matrix
+
+
+class DBTGeometry(DivergentBeamGeometry, AxisOrientedGeometry):
+
+    """DBT geometry with circular/helical source curve and flat detector.
+
+    The source moves along a spiral oriented along a fixed ``axis``, with
+    radius ``src_radius`` in the azimuthal plane and a given ``pitch``.
+    The detector reference point is opposite to the source, i.e. in
+    the point at distance ``src_rad + det_rad`` on the line in the
+    azimuthal plane through the source point and ``axis``. The detector
+    stays fixed.
+
+    The motion parameter is the 1d rotation angle parameterizing source
+    position.
+
+    In the standard configuration, the rotation axis is ``(0, 0, 1)``,
+    the initial source-to-detector vector is ``(0, 1, 0)``, and the
+    initial detector axes are ``[(1, 0, 0), (0, 0, 1)]``.
+
+    For details, check `the online docs
+    <https://odlgroup.github.io/odl/guide/geometry_guide.html>`_.
+    """
+
+    _default_config = dict(axis=(0, 0, 1),
+                           src_to_det_init=(0, 1, 0),
+                           det_axes_init=((1, 0, 0), (0, 0, 1)))
+
+    def __init__(self, apart, dpart, src_radius, det_radius, pitch=0,
+                 axis=(0, 0, 1), det_angle=0.0, **kwargs):
+        """Initialize a new instance.
+
+        Parameters
+        ----------
+        apart : 1-dim. `RectPartition`
+            Partition of the angle interval.
+        dpart : 2-dim. `RectPartition`
+            Partition of the detector parameter rectangle.
+        src_radius : nonnegative float
+            Radius of the source circle.
+        det_radius : nonnegative float
+            Radius of the detector circle. Must be nonzero if ``src_radius``
+            is zero.
+        det_angle: float, optional
+            Constant detector angle
+        pitch : float, optional
+            Constant distance along ``axis`` that a point on the helix
+            traverses when increasing the angle parameter by ``2 * pi``.
+            The default case ``pitch=0`` results in a circular cone
+            beam geometry.
+        axis : `array-like`, shape ``(3,)``, optional
+            Vector defining the fixed rotation axis of this geometry.
+
+        Other Parameters
+        ----------------
+        offset_along_axis : float, optional
+            Scalar offset along the ``axis`` at ``angle=0``, i.e., the
+            translation along the axis at angle 0 is
+            ``offset_along_axis * axis``.
+            Default: 0.
+        src_to_det_init : `array-like`, shape ``(3,)``, optional
+            Initial state of the vector pointing from source to detector
+            reference point. The zero vector is not allowed.
+            The default depends on ``axis``, see Notes.
+        det_axes_init : length-2-sequence of `array-like`'s, optional
+            Initial axes defining the detector orientation, provided as
+            arrays with shape ``(3,)``.
+            Default: depends on ``axis``, see Notes.
+        translation : `array-like`, shape ``(3,)``, optional
+            Global translation of the geometry. This is added last in any
+            method that computes an absolute vector, e.g., `det_refpoint`,
+            and also shifts the axis of rotation.
+            Default: ``(0, 0, 0)``
+        check_bounds : bool, optional
+            If ``True``, methods computing vectors check input arguments.
+            Checks are vectorized and add only a small overhead.
+            Default: ``True``
+
+        Notes
+        -----
+        In the default configuration, the rotation axis is ``(0, 0, 1)``,
+        the initial source-to-detector direction is ``(0, 1, 0)``,
+        and the default detector axes are ``[(1, 0, 0), (0, 0, 1)]``.
+        If a different ``axis`` is provided, the new default initial
+        position and the new default axes are the computed by rotating
+        the original ones by a matrix that transforms ``(0, 0, 1)`` to the
+        new (normalized) ``axis``. This matrix is calculated with the
+        `rotation_matrix_from_to` function. Expressed in code, we have ::
+
+            init_rot = rotation_matrix_from_to((0, 0, 1), axis)
+            src_to_det_init = init_rot.dot((0, 1, 0))
+            det_axes_init[0] = init_rot.dot((1, 0, 0))
+            det_axes_init[1] = init_rot.dot((0, 0, 1))
+
+        Examples
+        --------
+        Initialization with default parameters and some (arbitrary)
+        choices for pitch and radii:
+
+        >>> apart = odl.uniform_partition(0, 4 * np.pi, 10)
+        >>> dpart = odl.uniform_partition([-1, -1], [1, 1], (20, 20))
+        >>> geom = ConeFlatGeometry(
+        ...     apart, dpart, src_radius=5, det_radius=10, pitch=2)
+        >>> geom.src_position(0)
+        array([ 0., -5.,  0.])
+        >>> geom.det_refpoint(0)
+        array([ 0., 10.,  0.])
+        >>> np.allclose(geom.src_position(2 * np.pi),
+        ...             geom.src_position(0) + (0, 0, 2))  # z shift by pitch
+        True
+
+        Checking the default orientation:
+
+        >>> geom.axis
+        array([ 0.,  0.,  1.])
+        >>> geom.src_to_det_init
+        array([ 0.,  1.,  0.])
+        >>> geom.det_axes_init
+        array([[ 1.,  0.,  0.],
+               [ 0.,  0.,  1.]])
+
+        Specifying an axis by default rotates the standard configuration
+        to this position:
+
+        >>> e_x, e_y, e_z = np.eye(3)  # standard unit vectors
+        >>> geom = ConeFlatGeometry(
+        ...     apart, dpart, src_radius=5, det_radius=10, pitch=2,
+        ...     axis=(0, 1, 0))
+        >>> np.allclose(geom.axis, e_y)
+        True
+        >>> np.allclose(geom.src_to_det_init, -e_z)
+        True
+        >>> np.allclose(geom.det_axes_init, (e_x, e_y))
+        True
+        >>> geom = ConeFlatGeometry(
+        ...     apart, dpart, src_radius=5, det_radius=10, pitch=2,
+        ...     axis=(1, 0, 0))
+        >>> np.allclose(geom.axis, e_x)
+        True
+        >>> np.allclose(geom.src_to_det_init, e_y)
+        True
+        >>> np.allclose(geom.det_axes_init, (-e_z, e_x))
+        True
+
+        The initial source-to-detector vector and the detector axes can
+        also be set explicitly:
+
+        >>> geom = ConeFlatGeometry(
+        ...     apart, dpart, src_radius=5, det_radius=10, pitch=2,
+        ...     src_to_det_init=(-1, 0, 0),
+        ...     det_axes_init=((0, 1, 0), (0, 0, 1)))
+        >>> np.allclose(geom.axis, e_z)
+        True
+        >>> np.allclose(geom.src_to_det_init, -e_x)
+        True
+        >>> np.allclose(geom.det_axes_init, (e_y, e_z))
+        True
+        """
+        default_axis = self._default_config['axis']
+        default_src_to_det_init = self._default_config['src_to_det_init']
+        default_det_axes_init = self._default_config['det_axes_init']
+
+        # Handle initial coordinate system. We need to assign `None` to
+        # the vectors first since we want to check that `init_matrix`
+        # is not used together with those other parameters.
+        src_to_det_init = kwargs.pop('src_to_det_init', None)
+        det_axes_init = kwargs.pop('det_axes_init', None)
+
+        # Store some stuff for repr
+        if src_to_det_init is not None:
+            self._src_to_det_init_arg = np.asarray(src_to_det_init,
+                                                   dtype=float)
+        else:
+            self._src_to_det_init_arg = None
+
+        if det_axes_init is not None:
+            self._det_axes_init_arg = tuple(
+                np.asarray(a, dtype=float) for a in det_axes_init)
+        else:
+            self._det_axes_init_arg = None
+
+        self.det_angle = det_angle
+
+        # Compute the transformed system and the transition matrix. We
+        # transform only those vectors that were not explicitly given.
+        vecs_to_transform = []
+        if src_to_det_init is None:
+            vecs_to_transform.append(default_src_to_det_init)
+        if det_axes_init is None:
+            vecs_to_transform.extend(default_det_axes_init)
+
+        transformed_vecs = transform_system(
+            axis, default_axis, vecs_to_transform)
+        transformed_vecs = list(transformed_vecs)
+
+        axis = transformed_vecs.pop(0)
+        if src_to_det_init is None:
+            src_to_det_init = transformed_vecs.pop(0)
+        if det_axes_init is None:
+            det_axes_init = (transformed_vecs.pop(0), transformed_vecs.pop(0))
+        assert transformed_vecs == []
+
+        # Check and normalize `src_to_det_init`. Detector axes are
+        # normalized in the detector class.
+        if np.linalg.norm(src_to_det_init) == 0:
+            raise ValueError('`src_to_det_init` cannot be zero')
+        else:
+            src_to_det_init /= np.linalg.norm(src_to_det_init)
+
+        # Get stuff out of kwargs, otherwise upstream code complains
+        # about unknown parameters (rightly so)
+        self.__pitch = float(pitch)
+        self.__offset_along_axis = float(kwargs.pop('offset_along_axis', 0))
+        self.__src_radius = float(src_radius)
+
+        # Initialize stuff
+        self.__src_to_det_init = src_to_det_init
+        AxisOrientedGeometry.__init__(self, axis)
+        # `check_bounds` is needed for both detector and geometry
+        check_bounds = kwargs.get('check_bounds', True)
+        detector = Flat2dDetector(dpart, axes=det_axes_init,
+                                  check_bounds=check_bounds)
+        super(DBTGeometry, self).__init__(
+            ndim=3, motion_part=apart, detector=detector, **kwargs)
+
+        # Check parameters
+        if self.src_radius < 0:
+            raise ValueError('source circle radius {} is negative'
+                             ''.format(src_radius))
+        self.__det_radius = float(det_radius)
+        if self.det_radius < 0:
+            raise ValueError('detector circle radius {} is negative'
+                             ''.format(det_radius))
+
+        if self.src_radius == 0 and self.det_radius == 0:
+            raise ValueError('source and detector circle radii cannot both be '
+                             '0')
+
+        if self.motion_partition.ndim != 1:
+            raise ValueError('`apart` has dimension {}, expected 1'
+                             ''.format(self.motion_partition.ndim))
+
+    @classmethod
+    def frommatrix(cls, apart, dpart, src_radius, det_radius, init_matrix,
+                   pitch=0, **kwargs):
+        """Create an instance of `ConeFlatGeometry` using a matrix.
+
+        This alternative constructor uses a matrix to rotate and
+        translate the default configuration. It is most useful when
+        the transformation to be applied is already given as a matrix.
+
+        Parameters
+        ----------
+        apart : 1-dim. `RectPartition`
+            Partition of the parameter interval.
+        dpart : 2-dim. `RectPartition`
+            Partition of the detector parameter set.
+        src_radius : nonnegative float
+            Radius of the source circle.
+        det_radius : nonnegative float
+            Radius of the detector circle. Must be nonzero if ``src_radius``
+            is zero.
+        init_matrix : `array_like`, shape ``(3, 3)`` or ``(3, 4)``, optional
+            Transformation matrix whose left ``(3, 3)`` block is multiplied
+            with the default ``det_pos_init`` and ``det_axes_init`` to
+            determine the new vectors. If present, the fourth column acts
+            as a translation after the initial transformation.
+            The resulting ``det_axes_init`` will be normalized.
+        pitch : float, optional
+            Constant distance along the rotation axis that a point on the
+            helix traverses when increasing the angle parameter by
+            ``2 * pi``. The default case ``pitch=0`` results in a circular
+            cone beam geometry.
+        kwargs :
+            Further keyword arguments passed to the class constructor.
+
+        Returns
+        -------
+        geometry : `ConeFlatGeometry`
+
+        Examples
+        --------
+        Map unit vectors ``e_y -> e_z`` and ``e_z -> -e_y``, keeping the
+        right-handedness:
+
+        >>> apart = odl.uniform_partition(0, 2 * np.pi, 10)
+        >>> dpart = odl.uniform_partition([-1, -1], [1, 1], (20, 20))
+        >>> matrix = np.array([[1, 0, 0],
+        ...                    [0, 0, -1],
+        ...                    [0, 1, 0]])
+        >>> geom = ConeFlatGeometry.frommatrix(
+        ...     apart, dpart, src_radius=5, det_radius=10, pitch=2,
+        ...     init_matrix=matrix)
+        >>> geom.axis
+        array([ 0., -1.,  0.])
+        >>> geom.src_to_det_init
+        array([ 0.,  0.,  1.])
+        >>> geom.det_axes_init
+        array([[ 1.,  0.,  0.],
+               [ 0., -1.,  0.]])
+
+        Adding a translation with a fourth matrix column:
+
+        >>> matrix = np.array([[0, 0, -1, 0],
+        ...                    [0, 1, 0, 1],
+        ...                    [1, 0, 0, 1]])
+        >>> geom = ConeFlatGeometry.frommatrix(
+        ...     apart, dpart, src_radius=5, det_radius=10, pitch=2,
+        ...     init_matrix=matrix)
+        >>> geom.translation
+        array([ 0.,  1.,  1.])
+        >>> geom.det_refpoint(0)  # (0, 10, 0) + (0, 1, 1)
+        array([  0.,  11.,   1.])
+        """
+        for key in ('axis', 'src_to_det_init', 'det_axes_init', 'translation'):
+            if key in kwargs:
+                raise TypeError('got unknown keyword argument {!r}'
+                                ''.format(key))
+
+        # Get transformation and translation parts from `init_matrix`
+        init_matrix = np.asarray(init_matrix, dtype=float)
+        if init_matrix.shape not in ((3, 3), (3, 4)):
+            raise ValueError('`matrix` must have shape (3, 3) or (3, 4), '
+                             'got array with shape {}'
+                             ''.format(init_matrix.shape))
+        trafo_matrix = init_matrix[:, :3]
+        translation = init_matrix[:, 3:].squeeze()
+
+        # Transform the default vectors
+        default_axis = cls._default_config['axis']
+        default_src_to_det_init = cls._default_config['src_to_det_init']
+        default_det_axes_init = cls._default_config['det_axes_init']
+        vecs_to_transform = (default_src_to_det_init,) + default_det_axes_init
+        transformed_vecs = transform_system(
+            default_axis, None, vecs_to_transform, matrix=trafo_matrix)
+
+        # Use the standard constructor with these vectors
+        axis, src_to_det, det_axis_0, det_axis_1 = transformed_vecs
+        if translation.size == 0:
+            pass
+        else:
+            kwargs['translation'] = translation
+
+        return cls(apart, dpart, src_radius, det_radius, pitch, axis,
+                   src_to_det_init=src_to_det,
+                   det_axes_init=[det_axis_0, det_axis_1],
+                   **kwargs)
+
+    @property
+    def src_radius(self):
+        """Source circle radius of this geometry."""
+        return self.__src_radius
+
+    @property
+    def det_radius(self):
+        """Detector circle radius of this geometry."""
+        return self.__det_radius
+
+    @property
+    def pitch(self):
+        """Constant vertical distance traversed in a full rotation."""
+        return self.__pitch
+
+    @property
+    def src_to_det_init(self):
+        """Initial state of the vector pointing from source to detector
+        reference point."""
+        return self.__src_to_det_init
+
+    @property
+    def det_axes_init(self):
+        """Initial axes defining the detector orientation."""
+        return self.detector.axes
+
+    @property
+    def offset_along_axis(self):
+        """Scalar offset along ``axis`` at ``angle=0``."""
+        return self.__offset_along_axis
+
+    @property
+    def angles(self):
+        """Discrete angles given in this geometry."""
+        return self.motion_grid.coord_vectors[0]
+
+    def det_axes(self, angle):
+        """Return the detector axes tuple at ``angle``.
+
+        Parameters
+        ----------
+        angles : float or `array-like`
+            Angle(s) in radians describing the counter-clockwise rotation
+            of the detector around `axis`.
+
+        Returns
+        -------
+        axes : `numpy.ndarray`
+            Unit vectors along which the detector is aligned.
+            If ``angle`` is a single parameter, the returned array has
+            shape ``(2, 3)``, otherwise
+            ``broadcast(*angles).shape + (2, 3)``.
+
+        Notes
+        -----
+        To get an array that enumerates the detector axes in the first
+        dimension, move the second-to-last axis to the first position:
+
+            axes = det_axes(angle)
+            axes_enumeration = np.moveaxis(deriv, -2, 0)
+        """
+        # Transpose to take dot along axis 1
+        axes = self.rotation_matrix(self.det_angle * np.ones_like(angle)).dot(self.det_axes_init.T)
+        # `axes` has shape (a, 3, 2), need to roll the last dimensions
+        # to the second-to-last place
+        return np.rollaxis(axes, -1, -2)
+
+    def det_refpoint(self, angle):
+        """Return the detector reference point position at ``angle``.
+
+        For an angle ``phi``, the detector position is given by ::
+
+            det_ref(phi) = translation +
+                           rot_matrix(phi) * (det_rad * src_to_det_init) +
+                           (offset_along_axis + pitch * phi) * axis
+
+        where ``src_to_det_init`` is the initial unit vector pointing
+        from source to detector.
+
+        Parameters
+        ----------
+        angle : float or `array-like`
+            Angle(s) in radians describing the counter-clockwise
+            rotation of the detector.
+
+        Returns
+        -------
+        refpt : `numpy.ndarray`
+            Vector(s) pointing from the origin to the detector reference
+            point. If ``angle`` is a single parameter, the returned array
+            has shape ``(3,)``, otherwise ``angle.shape + (3,)``.
+
+        See Also
+        --------
+        src_position
+
+        Examples
+        --------
+        With default arguments, the detector starts at ``det_rad * e_y``
+        and rotates to ``det_rad * (-e_x) + pitch/4 * e_z`` at
+        90 degrees:
+
+        >>> apart = odl.uniform_partition(0, 4 * np.pi, 10)
+        >>> dpart = odl.uniform_partition([-1, -1], [1, 1], (20, 20))
+        >>> geom = ConeFlatGeometry(
+        ...     apart, dpart, src_radius=5, det_radius=10, pitch=2)
+        >>> geom.det_refpoint(0)
+        array([  0.,  10.,   0.])
+        >>> np.allclose(geom.det_refpoint(np.pi / 2), [-10, 0, 0.5])
+        True
+
+        The method is vectorized, i.e., it can be called with multiple
+        angles at once (or an n-dimensional array of angles):
+
+        >>> points = geom.det_refpoint([0, np.pi / 2])
+        >>> np.allclose(points[0], [0, 10, 0])
+        True
+        >>> np.allclose(points[1], [-10, 0, 0.5])
+        True
+        >>> geom.det_refpoint(np.zeros((4, 5))).shape
+        (4, 5, 3)
+        """
+        squeeze_out = (np.shape(angle) == ())
+        angle = np.array(angle, dtype=float, copy=False, ndmin=1)
+        angle = self.det_angle * np.ones_like(angle)
+        rot_matrix = self.rotation_matrix(angle)
+        extra_dims = angle.ndim
+
+        # Initial vector from center of rotation to detector.
+        # It can be computed this way since source and detector are at
+        # maximum distance, i.e. the connecting line passes the center.
+        center_to_det_init = self.det_radius * self.src_to_det_init
+        # `circle_component` has shape (a, ndim)
+        circle_component = rot_matrix.dot(center_to_det_init)
+
+        # Increment along the rotation axis according to pitch and
+        # offset_along_axis
+        # `shift_along_axis` has shape angles.shape
+        shift_along_axis = (self.offset_along_axis
+                            + self.pitch * angle / (2 * np.pi))
+        # Create outer product of `shift_along_axis` and `axis`, resulting
+        # in shape (a, ndim)
+        pitch_component = np.multiply.outer(shift_along_axis, self.axis)
+
+        # Broadcast translation along extra dimensions
+        transl_slc = (None,) * extra_dims + (slice(None),)
+        refpt = (self.translation[transl_slc]
+                 + circle_component
+                 + pitch_component)
+        if squeeze_out:
+            refpt = refpt.squeeze()
+
+        return refpt
+
+    def src_position(self, angle):
+        """Return the source position at ``angle``.
+
+        For an angle ``phi``, the source position is given by ::
+
+            src(phi) = translation +
+                       rot_matrix(phi) * (-src_rad * src_to_det_init) +
+                       (offset_along_axis + pitch * phi) * axis
+
+        where ``src_to_det_init`` is the initial unit vector pointing
+        from source to detector.
+
+        Parameters
+        ----------
+        angle : float or `array-like`
+            Angle(s) in radians describing the counter-clockwise
+            rotation of the detector.
+
+        Returns
+        -------
+        pos : `numpy.ndarray`, shape (3,) or (num_angles, 3)
+            Vector(s) pointing from the origin to the source position.
+            If ``angle`` is a single parameter, the returned array has
+            shape ``(3,)``, otherwise ``angle.shape + (3,)``.
+
+        See Also
+        --------
+        det_refpoint
+
+        Examples
+        --------
+        With default arguments, the source starts at ``src_rad * (-e_y)``
+        and rotates to ``src_rad * e_x + pitch/4 * e_z`` at
+        90 degrees:
+
+        >>> apart = odl.uniform_partition(0, 4 * np.pi, 10)
+        >>> dpart = odl.uniform_partition([-1, -1], [1, 1], (20, 20))
+        >>> geom = ConeFlatGeometry(
+        ...     apart, dpart, src_radius=5, det_radius=10, pitch=2)
+        >>> geom.src_position(0)
+        array([ 0., -5.,  0.])
+        >>> np.allclose(geom.src_position(np.pi / 2), [5, 0, 0.5])
+        True
+
+        The method is vectorized, i.e., it can be called with multiple
+        angles at once:
+
+        >>> points = geom.src_position([0, np.pi / 2])
+        >>> np.allclose(points[0], [0, -5, 0])
+        True
+        >>> np.allclose(points[1], [5, 0, 0.5])
+        True
+        >>> geom.src_position(np.zeros((4, 5))).shape
+        (4, 5, 3)
+        """
+        squeeze_out = (np.shape(angle) == ())
+        angle = np.array(angle, dtype=float, copy=False, ndmin=1)
+        rot_matrix = self.rotation_matrix(angle)
+        extra_dims = angle.ndim
+
+        # Initial vector from center of rotation to source.
+        # It can be computed this way since source and detector are at
+        # maximum distance, i.e. the connecting line passes the center.
+        center_to_src_init = -self.src_radius * self.src_to_det_init
+        # `circle_component` has shape (a, ndim)
+        circle_component = rot_matrix.dot(center_to_src_init)
+
+        # Increment along the rotation axis according to pitch and
+        # offset_along_axis
+        # `shift_along_axis` has shape angles.shape
+        shift_along_axis = (self.offset_along_axis
+                            + self.pitch * angle / (2 * np.pi))
+        # Create outer product of `shift_along_axis` and `axis`, resulting
+        # in shape (a, ndim)
+        pitch_component = np.multiply.outer(shift_along_axis, self.axis)
+
+        # Broadcast translation along extra dimensions
+        transl_slc = (None,) * extra_dims + (slice(None),)
+        refpt = (self.translation[transl_slc]
+                 + circle_component
+                 + pitch_component)
+        if squeeze_out:
+            refpt = refpt.squeeze()
+
+        return refpt
+
+    def __repr__(self):
+        """Return ``repr(self)``."""
+        posargs = [self.motion_partition, self.det_partition]
+        optargs = [('src_radius', self.src_radius, -1),
+                   ('det_radius', self.det_radius, -1),
+                   ('pitch', self.pitch, 0)
+                   ]
+
+        if not np.allclose(self.axis, self._default_config['axis']):
+            optargs.append(['axis', array_str(self.axis), ''])
+
+        optargs.append(['offset_along_axis', self.offset_along_axis, 0])
+
+        if self._src_to_det_init_arg is not None:
+            optargs.append(['src_to_det_init',
+                            array_str(self._src_to_det_init_arg),
+                            None])
+
+        if self._det_axes_init_arg is not None:
+            optargs.append(
+                ['det_axes_init',
+                 tuple(array_str(a) for a in self._det_axes_init_arg),
+                 None])
+
+        if not np.array_equal(self.translation, (0, 0, 0)):
+            optargs.append(['translation', array_str(self.translation), ''])
+
+        sig_str = signature_string(posargs, optargs, sep=',\n')
+        return '{}(\n{}\n)'.format(self.__class__.__name__, indent(sig_str))
+
+    def __getitem__(self, indices):
+        """Return self[indices].
+
+        This is defined by ::
+
+            self[indices].partition == self.partition[indices]
+
+        where all other parameters are the same.
+
+        Examples
+        --------
+        >>> apart = odl.uniform_partition(0, 4, 4)
+        >>> dpart = odl.uniform_partition([-1, -1], [1, 1], [20, 20])
+        >>> geom = odl.tomo.ConeFlatGeometry(apart, dpart, 50, 100, pitch=2)
+
+        Extract sub-geometry with every second angle:
+
+        >>> geom[::2]
+        ConeFlatGeometry(
+            nonuniform_partition(
+                [ 0.5,  2.5],
+                min_pt=0.0, max_pt=4.0
+            ),
+            uniform_partition([-1., -1.], [ 1.,  1.], (20, 20)),
+            src_radius=50.0,
+            det_radius=100.0,
+            pitch=2.0
+        )
+        """
+        part = self.partition[indices]
+        apart = part.byaxis[0]
+        dpart = part.byaxis[1:]
+
+        return DBTGeometry(apart, dpart,
+                                src_radius=self.src_radius,
+                                det_radius=self.det_radius,
+                                pitch=self.pitch,
+                                det_angle=self.det_angle,
+                                axis=self.axis,
+                                offset_along_axis=self.offset_along_axis,
+                                src_to_det_init=self._src_to_det_init_arg,
+                                det_axes_init=self._det_axes_init_arg,
+                                translation=self.translation)
+
+    # Manually override the abstract method in `Geometry` since it's found
+    # first
+    rotation_matrix = AxisOrientedGeometry.rotation_matrix
+
 
 
 def cone_beam_geometry(space, src_radius, det_radius, num_angles=None,
