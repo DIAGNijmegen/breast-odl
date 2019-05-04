@@ -14,7 +14,6 @@ restricted to) inverse problems.
 
 from __future__ import absolute_import
 import numpy as np
-import set
 
 __version__ = '1.0.0.dev0'
 __all__ = ('set',
