@@ -386,7 +386,7 @@ class OperatorFunction(torch.autograd.Function):
         # Apply scaling, convert to tensor and return
         if scaling != 1.0:
             result_arr *= scaling
-        grad_input = torch.from_numpy(result_arr).to(grad_output.device)
+        grad_input = torch.from_numpy(result_arr).to(grad_output.device).type(grad_output.type())
         return None, grad_input  # return `None` for the `operator` part
 
 
