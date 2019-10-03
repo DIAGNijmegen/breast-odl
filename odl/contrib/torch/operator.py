@@ -249,7 +249,7 @@ class OperatorFunction(torch.autograd.Function):
             ).astype(op_out_dtype, copy=False)
 
         # Convert back to tensor
-        tensor = torch.from_numpy(result_arr).to(input.device)
+        tensor = torch.from_numpy(result_arr).to(input.device).type(input.type())
         return tensor
 
     @staticmethod
